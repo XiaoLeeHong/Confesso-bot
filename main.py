@@ -5,6 +5,7 @@ import asyncio
 import motor.motor_asyncio
 import os
 import datetime
+import re
 
 # ================= ENV =================
 
@@ -12,14 +13,12 @@ TOKEN = os.getenv("TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 
 if not TOKEN or not MONGO_URL:
-    raise Exception("TOKEN or MONGO_URL missing in environment variables.")
+    raise Exception("TOKEN or MONGO_URL missing.")
 
-# ================= BOT SETUP =================
+# ================= BOT =================
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
-intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -30,8 +29,8 @@ db = mongo["confession_bot"]
 confessions_db = db["confessions"]
 settings_db = db["settings"]
 cooldown_db = db["cooldowns"]
-logs_db = db["logs"]
 bans_db = db["bans"]
+counters_db = db["counters"]
 
 confession_queue = asyncio.Queue()
 worker_started = False
@@ -40,57 +39,43 @@ DEFAULT_DELAY = 5
 DAILY_LIMIT = 3
 COOLDOWN_SECONDS = 15
 
-DEFAULT_AUTOMOD = {
-    "banned_words": [],
-    "block_links": True,
-    "block_invites": True,
-    "block_caps": True,
-    "block_mentions": True,
-    "manual_review": False,
-    "review_channel_id": None
-}
+BAD_WORDS = ["fuck", "shit", "bitch", "asshole", "nigger", "slut"]
 
-# ================= UTIL =================
-
-async def get_guild_config(guild_id):
-    config = await settings_db.find_one({"guild_id": guild_id})
-    return config
+# ================= GLOBAL COUNTER =================
 
 async def generate_confession_id():
-    count = await confessions_db.count_documents({})
-    return count + 1
+    counter = await counters_db.find_one_and_update(
+        {"_id": "confession_id"},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=True
+    )
+    if not counter or "value" not in counter:
+        doc = await counters_db.find_one({"_id": "confession_id"})
+        return doc["value"]
+    return counter["value"]
 
 # ================= AUTOMOD =================
 
-async def run_automod(guild_id: int, message: str):
-    config = await get_guild_config(guild_id)
-    if not config:
-        return True, "System not configured."
+async def run_automod(message: str):
+    lower = message.lower()
 
-    automod = config.get("automod", DEFAULT_AUTOMOD)
-    lower_msg = message.lower()
+    if "discord.gg/" in lower or "discord.com/invite" in lower:
+        return True, "Invites are not allowed."
 
-    for word in automod.get("banned_words", []):
-        if word in lower_msg:
-            return True, "Blocked word detected."
+    if "http://" in lower or "https://" in lower:
+        return True, "Links are not allowed."
 
-    if automod.get("block_invites", True):
-        if "discord.gg/" in lower_msg or "discord.com/invite" in lower_msg:
-            return True, "Invites not allowed."
+    if any(word in lower for word in BAD_WORDS):
+        return True, "Inappropriate language detected."
 
-    if automod.get("block_links", True):
-        if "http://" in lower_msg or "https://" in lower_msg:
-            return True, "Links not allowed."
+    if len(message) > 15:
+        caps_ratio = sum(c.isupper() for c in message) / len(message)
+        if caps_ratio > 0.7:
+            return True, "Too many caps."
 
-    if automod.get("block_caps", True):
-        if len(message) > 15:
-            caps_ratio = sum(c.isupper() for c in message) / len(message)
-            if caps_ratio > 0.7:
-                return True, "Too many caps."
-
-    if automod.get("block_mentions", True):
-        if "@everyone" in message or "@here" in message:
-            return True, "Mass mentions blocked."
+    if "@everyone" in message or "@here" in message:
+        return True, "Mass mentions blocked."
 
     return False, None
 
@@ -98,51 +83,51 @@ async def run_automod(guild_id: int, message: str):
 
 async def confession_worker():
     await bot.wait_until_ready()
+    print("Confession worker started.")
 
     while True:
-        data = await confession_queue.get()
-        guild_id = data["guild_id"]
-        message = data["text"]
-        confession_id = data["id"]
+        try:
+            data = await confession_queue.get()
 
-        config = await get_guild_config(guild_id)
-        if not config:
-            continue
+            confession_id = data["id"]
+            message = data["text"]
 
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            continue
+            embed = discord.Embed(
+                title=f"🌍 Global Anonymous Confession #{confession_id}",
+                description=message,
+                color=discord.Color.purple(),
+                timestamp=datetime.datetime.utcnow()
+            )
 
-        channel = guild.get_channel(config["channel_id"])
-        if not channel:
-            continue
+            async for guild_data in settings_db.find({}):
+                guild = bot.get_guild(guild_data["guild_id"])
+                if not guild:
+                    continue
 
-        embed = discord.Embed(
-            title=f"💜 Anonymous Confession #{confession_id}",
-            description=message,
-            color=discord.Color.purple(),
-            timestamp=datetime.datetime.now(datetime.UTC)
-        )
+                channel = guild.get_channel(guild_data["channel_id"])
+                if not channel:
+                    continue
 
-        msg = await channel.send(embed=embed)
-        await msg.add_reaction("👍")
-        await msg.add_reaction("👎")
+                try:
+                    msg = await channel.send(embed=embed)
+                    await msg.add_reaction("👍")
+                    await msg.add_reaction("👎")
+                except Exception as e:
+                    print(f"Send failed: {e}")
+                    continue
 
-        await logs_db.insert_one({
-            "guild_id": guild_id,
-            "confession_id": confession_id,
-            "message": message,
-            "timestamp": datetime.datetime.utcnow()
-        })
+            await asyncio.sleep(DEFAULT_DELAY)
 
-        delay = config.get("delay", DEFAULT_DELAY)
-        await asyncio.sleep(delay)
+        except Exception as e:
+            print(f"Worker error: {e}")
+            await asyncio.sleep(5)
 
 # ================= EVENTS =================
 
 @bot.event
 async def on_ready():
     global worker_started
+
     if not worker_started:
         bot.loop.create_task(confession_worker())
         worker_started = True
@@ -160,104 +145,78 @@ async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
         {"guild_id": interaction.guild.id},
         {"$set": {
             "guild_id": interaction.guild.id,
-            "channel_id": channel.id,
-            "automod": DEFAULT_AUTOMOD,
-            "delay": DEFAULT_DELAY
+            "channel_id": channel.id
         }},
         upsert=True
     )
 
-    await interaction.response.send_message("Confession channel set.", ephemeral=True)
-
-# ================= AUTOMOD MANAGEMENT =================
-
-@tree.command(name="addbannedword", description="Add banned word")
-@app_commands.checks.has_permissions(administrator=True)
-async def addbannedword(interaction: discord.Interaction, word: str):
-    await settings_db.update_one(
-        {"guild_id": interaction.guild.id},
-        {"$push": {"automod.banned_words": word.lower()}}
+    await interaction.response.send_message(
+        "Server joined global confession network.",
+        ephemeral=True
     )
-    await interaction.response.send_message("Word added.", ephemeral=True)
 
-@tree.command(name="removebannedword", description="Remove banned word")
-@app_commands.checks.has_permissions(administrator=True)
-async def removebannedword(interaction: discord.Interaction, word: str):
-    await settings_db.update_one(
-        {"guild_id": interaction.guild.id},
-        {"$pull": {"automod.banned_words": word.lower()}}
-    )
-    await interaction.response.send_message("Word removed.", ephemeral=True)
+# ================= CONFESS =================
 
-# ================= BAN SYSTEM =================
-
-@tree.command(name="confessban", description="Ban user from confessing")
-@app_commands.checks.has_permissions(administrator=True)
-async def confessban(interaction: discord.Interaction, user: discord.User):
-    await bans_db.update_one(
-        {"guild_id": interaction.guild.id},
-        {"$addToSet": {"banned_users": user.id}},
-        upsert=True
-    )
-    await interaction.response.send_message("User banned from confessions.", ephemeral=True)
-
-# ================= CONFESSION =================
-
-@tree.command(name="confess", description="Send anonymous confession")
+@tree.command(name="confess", description="Send global anonymous confession")
 async def confess(interaction: discord.Interaction, message: str):
 
-    guild_id = interaction.guild.id
+    await interaction.response.defer(ephemeral=True)
+
     user_id = interaction.user.id
+    guild_id = interaction.guild.id
 
     if len(message) > 1500:
-        await interaction.response.send_message("Too long.", ephemeral=True)
+        await interaction.followup.send("Message too long.", ephemeral=True)
         return
 
-    # Ban check
-    banned = await bans_db.find_one({"guild_id": guild_id, "banned_users": user_id})
+    banned = await bans_db.find_one({
+        "guild_id": guild_id,
+        "user_id": user_id
+    })
+
     if banned:
-        await interaction.response.send_message("You are banned from confessing.", ephemeral=True)
+        await interaction.followup.send("You are banned.", ephemeral=True)
         return
 
-    # Cooldown
-    cooldown = await cooldown_db.find_one({"guild_id": guild_id, "user_id": user_id})
     now = datetime.datetime.utcnow()
+    cooldown = await cooldown_db.find_one({
+        "guild_id": guild_id,
+        "user_id": user_id
+    })
 
     if cooldown:
-        last_used = cooldown["last_used"]
-        diff = (now - last_used).total_seconds()
+        diff = (now - cooldown["last_used"]).total_seconds()
         if diff < COOLDOWN_SECONDS:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Cooldown active. Try again in {int(COOLDOWN_SECONDS - diff)}s.",
                 ephemeral=True
             )
             return
 
-    # Daily limit
     today = now.date().isoformat()
+
     count = await confessions_db.count_documents({
-        "guild_id": guild_id,
         "user_id": user_id,
         "date": today
     })
 
     if count >= DAILY_LIMIT:
-        await interaction.response.send_message("Daily limit reached.", ephemeral=True)
+        await interaction.followup.send("Daily limit reached.", ephemeral=True)
         return
 
-    blocked, reason = await run_automod(guild_id, message)
+    blocked, reason = await run_automod(message)
     if blocked:
-        await interaction.response.send_message(reason, ephemeral=True)
+        await interaction.followup.send(reason, ephemeral=True)
         return
 
     confession_id = await generate_confession_id()
 
     await confessions_db.insert_one({
-        "guild_id": guild_id,
+        "confession_id": confession_id,
         "user_id": user_id,
+        "guild_origin": guild_id,
         "message": message,
-        "date": today,
-        "confession_id": confession_id
+        "date": today
     })
 
     await cooldown_db.update_one(
@@ -267,12 +226,57 @@ async def confess(interaction: discord.Interaction, message: str):
     )
 
     await confession_queue.put({
-        "guild_id": guild_id,
-        "text": message,
-        "id": confession_id
+        "id": confession_id,
+        "text": message
     })
 
-    await interaction.response.send_message("Confession queued anonymously.", ephemeral=True)
+    await interaction.followup.send(
+        "Your confession was sent globally.",
+        ephemeral=True
+    )
+
+# ================= BAN SYSTEM =================
+
+@tree.command(name="banconfess", description="Ban user from confessing")
+@app_commands.checks.has_permissions(administrator=True)
+async def banconfess(interaction: discord.Interaction, user: discord.Member):
+
+    await bans_db.update_one(
+        {"guild_id": interaction.guild.id, "user_id": user.id},
+        {"$set": {"user_id": user.id}},
+        upsert=True
+    )
+
+    await interaction.response.send_message("User banned from confessing.")
+
+@tree.command(name="unbanconfess", description="Unban user")
+@app_commands.checks.has_permissions(administrator=True)
+async def unbanconfess(interaction: discord.Interaction, user: discord.Member):
+
+    await bans_db.delete_one({
+        "guild_id": interaction.guild.id,
+        "user_id": user.id
+    })
+
+    await interaction.response.send_message("User unbanned.")
+
+# ================= STATS =================
+
+@tree.command(name="confessionstats", description="View global stats")
+async def confessionstats(interaction: discord.Interaction):
+
+    total = await confessions_db.count_documents({})
+    servers = await settings_db.count_documents({})
+
+    embed = discord.Embed(
+        title="Global Confession Network Stats",
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(name="Total Confessions", value=str(total))
+    embed.add_field(name="Active Servers", value=str(servers))
+
+    await interaction.response.send_message(embed=embed)
 
 # ================= RUN =================
 

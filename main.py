@@ -85,7 +85,7 @@ async def confession_worker():
     await bot.wait_until_ready()
     print("Confession worker started.")
 
-    while True:
+    while not bot.is_closed():
         try:
             data = await confession_queue.get()
 
@@ -99,27 +99,70 @@ async def confession_worker():
                 timestamp=datetime.datetime.utcnow()
             )
 
+            active_servers = 0
+            success_servers = 0
+            failed_servers = 0
+
             async for guild_data in settings_db.find({}):
-                guild = bot.get_guild(guild_data["guild_id"])
+                active_servers += 1
+                guild_id = guild_data.get("guild_id")
+                channel_id = guild_data.get("channel_id")
+
+                print(f"\nChecking guild_id: {guild_id}")
+
+                guild = bot.get_guild(guild_id)
                 if not guild:
+                    print("❌ Guild not found in bot cache. Skipping.")
+                    failed_servers += 1
                     continue
 
-                channel = guild.get_channel(guild_data["channel_id"])
+                channel = guild.get_channel(channel_id)
                 if not channel:
+                    print(f"❌ Channel not found in {guild.name}. Removing broken config.")
+                    await settings_db.delete_one({"guild_id": guild_id})
+                    failed_servers += 1
+                    continue
+
+                # Permission check
+                perms = channel.permissions_for(guild.me)
+                if not perms.send_messages or not perms.embed_links:
+                    print(f"❌ Missing permissions in {guild.name}.")
+                    failed_servers += 1
                     continue
 
                 try:
                     msg = await channel.send(embed=embed)
                     await msg.add_reaction("👍")
                     await msg.add_reaction("👎")
+
+                    print(f"✅ Sent confession #{confession_id} to {guild.name}")
+                    success_servers += 1
+
+                except discord.Forbidden:
+                    print(f"❌ Forbidden in {guild.name}. Removing config.")
+                    await settings_db.delete_one({"guild_id": guild_id})
+                    failed_servers += 1
+
+                except discord.HTTPException as e:
+                    print(f"❌ HTTP error in {guild.name}: {e}")
+                    failed_servers += 1
+
                 except Exception as e:
-                    print(f"Send failed: {e}")
-                    continue
+                    print(f"❌ Unexpected error in {guild.name}: {e}")
+                    failed_servers += 1
+
+                await asyncio.sleep(1)
+
+            print("\n====== BROADCAST SUMMARY ======")
+            print(f"Active servers: {active_servers}")
+            print(f"Successful sends: {success_servers}")
+            print(f"Failed sends: {failed_servers}")
+            print("================================\n")
 
             await asyncio.sleep(DEFAULT_DELAY)
 
         except Exception as e:
-            print(f"Worker error: {e}")
+            print(f"Worker fatal error: {e}")
             await asyncio.sleep(5)
 
 # ================= EVENTS =================

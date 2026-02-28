@@ -27,19 +27,18 @@ confessions_db = db["confessions"]
 settings_db = db["settings"]
 cooldown_db = db["cooldowns"]
 config_db = db["config"]
+logs_db = db["logs"]
 
 confession_queue = asyncio.Queue()
 DEFAULT_DELAY = 5
-
+DAILY_LIMIT = 3
+COOLDOWN_SECONDS = 15
 
 # ================= GLOBAL CONFIG =================
 
 async def get_global_delay():
     config = await config_db.find_one({"type": "global"})
-    if config:
-        return config.get("delay", DEFAULT_DELAY)
-    return DEFAULT_DELAY
-
+    return config.get("delay", DEFAULT_DELAY) if config else DEFAULT_DELAY
 
 async def set_global_delay(seconds: int):
     await config_db.update_one(
@@ -48,22 +47,19 @@ async def set_global_delay(seconds: int):
         upsert=True
     )
 
-
 # ================= WORKER =================
 
 async def confession_worker():
     await bot.wait_until_ready()
     print("Confession worker started.")
 
-    while not bot.is_closed():
+    while True:
         data = await confession_queue.get()
-        confession_text = data["text"]
+        message = data["text"]
 
         delay = await get_global_delay()
-
-        print("Broadcasting confession...")
-
         settings = settings_db.find({})
+
         async for guild_data in settings:
             try:
                 guild = bot.get_guild(guild_data["guild_id"])
@@ -76,18 +72,20 @@ async def confession_worker():
 
                 embed = discord.Embed(
                     title="💜 Anonymous Confession",
-                    description=confession_text,
+                    description=message,
                     color=discord.Color.purple(),
                     timestamp=datetime.datetime.now(datetime.UTC)
                 )
+                embed.set_footer(text="Stay respectful.")
 
                 await channel.send(embed=embed)
 
             except Exception as e:
-                print("Error sending to guild:", e)
+                print(f"Error sending confession: {e}")
 
         await asyncio.sleep(delay)
 
+# ================= EVENTS =================
 
 @bot.event
 async def on_ready():
@@ -95,126 +93,124 @@ async def on_ready():
     await tree.sync()
     print(f"Logged in as {bot.user}")
 
-
 # ================= SETUP COMMANDS =================
 
 @tree.command(name="setup", description="Set confession channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
-    await interaction.response.defer()
-
     await settings_db.update_one(
         {"guild_id": interaction.guild.id},
-        {
-            "$set": {
-                "guild_id": interaction.guild.id,
-                "channel_id": channel.id
-            }
-        },
+        {"$set": {
+            "guild_id": interaction.guild.id,
+            "channel_id": channel.id
+        }},
         upsert=True
     )
 
-    await interaction.followup.send(
+    await interaction.response.send_message(
         f"Confession channel set to {channel.mention}",
-        ephemeral=False
+        ephemeral=True
     )
 
-
-@tree.command(name="removesetup", description="Disable confessions in this server")
+@tree.command(name="removesetup", description="Disable confessions")
 @app_commands.checks.has_permissions(administrator=True)
-async def removesetup(interaction: discord.Interaction):
-    await interaction.response.defer()
-
+async def removesetup(interaction: discord.Interation):
     await settings_db.delete_one({"guild_id": interaction.guild.id})
-
-    await interaction.followup.send(
-        "Confession system disabled in this server.",
-        ephemeral=False
+    await interaction.response.send_message(
+        "Confession system disabled.",
+        ephemeral=True
     )
 
-
-@tree.command(name="config", description="View server configuration")
+@tree.command(name="config", description="View server config")
 async def config(interaction: discord.Interaction):
-    await interaction.response.defer()
+    data = await settings_db.find_one({"guild_id": interaction.guild.id})
 
-    config_data = await settings_db.find_one({"guild_id": interaction.guild.id})
-    delay = await get_global_delay()
-
-    if not config_data:
-        await interaction.followup.send("Confession not set up in this server.")
+    if not data:
+        await interaction.response.send_message(
+            "Confessions not set up in this server.",
+            ephemeral=True
+        )
         return
 
-    channel = bot.get_channel(config_data["channel_id"])
+    delay = await get_global_delay()
+    channel = bot.get_channel(data["channel_id"])
 
     embed = discord.Embed(
-        title="Server Confession Config",
+        title="Confession Config",
         color=discord.Color.blurple()
     )
-    embed.add_field(name="Channel", value=channel.mention if channel else "Not found")
-    embed.add_field(name="Global Delay", value=f"{delay} seconds")
+    embed.add_field(name="Channel", value=channel.mention if channel else "Not Found")
+    embed.add_field(name="Global Delay", value=f"{delay}s")
 
-    await interaction.followup.send(embed=embed)
-
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ================= GLOBAL DELAY =================
 
-@tree.command(name="setdelay", description="Set global confession delay (seconds)")
+@tree.command(name="setdelay", description="Set global confession delay")
 @app_commands.checks.has_permissions(administrator=True)
 async def setdelay(interaction: discord.Interaction, seconds: int):
-    await interaction.response.defer()
-
     if seconds < 1:
-        await interaction.followup.send("Delay must be at least 1 second.")
+        await interaction.response.send_message(
+            "Delay must be at least 1 second.",
+            ephemeral=True
+        )
         return
 
     await set_global_delay(seconds)
 
-    await interaction.followup.send(
-        f"Global delay set to {seconds} seconds.",
-        ephemeral=False
+    await interaction.response.send_message(
+        f"Global delay set to {seconds}s",
+        ephemeral=True
     )
-
 
 # ================= CONFESSION =================
 
 @tree.command(name="confess", description="Send anonymous confession")
 async def confess(interaction: discord.Interaction, message: str):
-    await interaction.response.defer()
+
+    if len(message) > 1500:
+        await interaction.response.send_message(
+            "Confession too long. Keep it under 1500 characters.",
+            ephemeral=True
+        )
+        return
 
     user_id = interaction.user.id
     today = datetime.date.today().isoformat()
     now = datetime.datetime.now(datetime.UTC)
 
     # DAILY LIMIT
-    record = await confessions_db.find_one({"user_id": user_id, "date": today})
+    record = await confessions_db.find_one(
+        {"user_id": user_id, "date": today}
+    )
 
-    if record and record["count"] >= 3:
-        await interaction.followup.send(
-            "You have reached the daily limit of 3 confessions.",
-            ephemeral=False
+    if record and record["count"] >= DAILY_LIMIT:
+        await interaction.response.send_message(
+            f"You reached the daily limit of {DAILY_LIMIT}.",
+            ephemeral=True
         )
         return
 
-    # SWEAR FILTER
-    banned_words = ["badword1", "badword2"]
-    if any(word in message.lower() for word in banned_words):
-        await interaction.followup.send(
-            "Swear words are not allowed.",
-            ephemeral=False
-        )
-        return
-
-    # COOLDOWN (15 sec)
-    cooldown_record = await cooldown_db.find_one({"user_id": user_id})
-
-    if cooldown_record:
-        last_used = cooldown_record["last_used"]
-        if (now - last_used).total_seconds() < 15:
-            await interaction.followup.send(
-                "You are on cooldown. Please wait before confessing again.",
-                ephemeral=False
+    # COOLDOWN
+    cooldown = await cooldown_db.find_one({"user_id": user_id})
+    if cooldown:
+        last = cooldown["last_used"]
+        if (now - last).total_seconds() < COOLDOWN_SECONDS:
+            remaining = int(COOLDOWN_SECONDS - (now - last).total_seconds())
+            await interaction.response.send_message(
+                f"Cooldown active. Wait {remaining}s.",
+                ephemeral=True
             )
             return
+
+    # SWEAR FILTER (basic)
+    banned_words = ["badword1", "badword2"]
+    if any(word in message.lower() for word in banned_words):
+        await interaction.response.send_message(
+            "Message contains blocked words.",
+            ephemeral=True
+        )
+        return
 
     # Update cooldown
     await cooldown_db.update_one(
@@ -234,32 +230,37 @@ async def confess(interaction: discord.Interaction, message: str):
             {"user_id": user_id, "date": today, "count": 1}
         )
 
-    # Queue
+    # Log confession internally
+    await logs_db.insert_one({
+        "user_id": user_id,
+        "message": message,
+        "timestamp": now
+    })
+
     await confession_queue.put({"text": message})
 
-    await interaction.followup.send(
-        "Your confession has been added to the global queue.",
-        ephemeral=False
+    await interaction.response.send_message(
+        "Your confession has been queued anonymously.",
+        ephemeral=True
     )
-
 
 # ================= STATS =================
 
-@tree.command(name="stats", description="View global confession stats")
+@tree.command(name="stats", description="View global stats")
 async def stats(interaction: discord.Interaction):
-    await interaction.response.defer()
 
-    total_confessions = await confessions_db.count_documents({})
+    total_confessions = await logs_db.count_documents({})
     total_servers = await settings_db.count_documents({})
 
     embed = discord.Embed(
-        title="Global Stats",
+        title="Global Confession Stats",
         color=discord.Color.green()
     )
-    embed.add_field(name="Total Confessions", value=str(total_confessions))
+    embed.add_field(name="Total Confessions Sent", value=str(total_confessions))
     embed.add_field(name="Servers Connected", value=str(total_servers))
 
-    await interaction.followup.send(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# ================= RUN =================
 
 bot.run(TOKEN)

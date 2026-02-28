@@ -1,201 +1,159 @@
-import os
-import re
-import random
-import datetime
 import discord
 from discord import app_commands
-
-from database import guilds, cooldowns
-from cooldown import check_cooldown
-from config import DEFAULT_EMBED_COLOR
+from discord.ext import commands
+import asyncio
+import motor.motor_asyncio
+import os
+import datetime
 
 TOKEN = os.getenv("TOKEN")
-
-if not TOKEN:
-    raise ValueError("TOKEN environment variable is not set.")
+MONGO_URL = os.getenv("MONGO_URL")
 
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
-# ------------------------
-# CONFIG
-# ------------------------
+mongo = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
+db = mongo["confession_bot"]
+confessions_db = db["confessions"]
+settings_db = db["settings"]
+cooldown_db = db["cooldowns"]
 
-BANNED_WORDS = [
-    "fuck",
-    "shit",
-    "bitch",
-    "asshole",
-    "nigger",
-    "cunt"
-]
-
-ANONYMOUS_TAGS = [
-    "Unknown Soul",
-    "Hidden Mind",
-    "Secret Whisper",
-    "Anonymous Ghost",
-    "Mystery Human",
-    "Silent Stranger"
-]
-
-# ------------------------
-# FILTER FUNCTIONS
-# ------------------------
-
-def normalize_text(text: str) -> str:
-    """
-    Removes spaces, symbols and repeated characters
-    to prevent bypass like f.u.c.k or fuuuck
-    """
-    text = text.lower()
-    text = re.sub(r'[^a-z]', '', text)  # remove symbols
-    text = re.sub(r'(.)\1+', r'\1', text)  # remove repeated letters
-    return text
+confession_queue = asyncio.Queue()
+global_delay = 5  # default delay in seconds
 
 
-def contains_banned_word(message: str) -> bool:
-    normalized = normalize_text(message)
-    for word in BANNED_WORDS:
-        if word in normalized:
-            return True
-    return False
+# ================= BACKGROUND WORKER =================
 
+async def confession_worker():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        data = await confession_queue.get()
+        confession_text = data["text"]
 
-async def check_daily_limit(user_id: int) -> bool:
-    """
-    Returns True if user can send confession.
-    Allows only 3 per day globally.
-    """
-    today = datetime.date.today().isoformat()
+        settings = settings_db.find({})
+        async for guild_data in settings:
+            guild = bot.get_guild(guild_data["guild_id"])
+            if guild:
+                channel = guild.get_channel(guild_data["channel_id"])
+                if channel:
+                    embed = discord.Embed(
+                        title="New Anonymous Confession",
+                        description=confession_text,
+                        color=discord.Color.purple()
+                    )
+                    await channel.send(embed=embed)
 
-    record = await cooldowns.find_one({
-        "user_id": user_id,
-        "date": today
-    })
+        await asyncio.sleep(global_delay)
 
-    if not record:
-        await cooldowns.insert_one({
-            "user_id": user_id,
-            "date": today,
-            "count": 1
-        })
-        return True
-
-    if record["count"] >= 3:
-        return False
-
-    await cooldowns.update_one(
-        {"_id": record["_id"]},
-        {"$inc": {"count": 1}}
-    )
-
-    return True
-
-
-# ------------------------
-# EVENTS
-# ------------------------
 
 @bot.event
 async def on_ready():
+    bot.loop.create_task(confession_worker())
     await tree.sync()
     print(f"Logged in as {bot.user}")
 
 
-# ------------------------
-# SETUP COMMAND
-# ------------------------
+# ================= SETUP COMMAND =================
 
-@tree.command(name="setup", description="Setup confession system")
+@tree.command(name="setup", description="Set confession channel")
 @app_commands.checks.has_permissions(administrator=True)
-async def setup(
-    interaction: discord.Interaction,
-    confession_channel: discord.TextChannel,
-    log_channel: discord.TextChannel,
-    cooldown: int
-):
-    await guilds.update_one(
+async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer()
+
+    await settings_db.update_one(
         {"guild_id": interaction.guild.id},
-        {
-            "$set": {
-                "guild_id": interaction.guild.id,
-                "confession_channel": confession_channel.id,
-                "log_channel": log_channel.id,
-                "cooldown": cooldown,
-                "embed_color": DEFAULT_EMBED_COLOR
-            }
-        },
+        {"$set": {"channel_id": channel.id}},
         upsert=True
     )
 
-    await interaction.response.send_message(
-        "Confession system configured successfully.",
-        ephemeral=True
+    await interaction.followup.send(
+        f"Confession channel set to {channel.mention}",
+        ephemeral=False
     )
 
 
-# ------------------------
-# CONFESS COMMAND (GLOBAL)
-# ------------------------
+# ================= SET GLOBAL DELAY =================
 
-@tree.command(name="confess", description="Send an anonymous confession")
+@tree.command(name="setdelay", description="Set global confession delay in seconds")
+@app_commands.checks.has_permissions(administrator=True)
+async def setdelay(interaction: discord.Interaction, seconds: int):
+    global global_delay
+    await interaction.response.defer()
+
+    global_delay = seconds
+
+    await interaction.followup.send(
+        f"Global confession delay set to {seconds} seconds.",
+        ephemeral=False
+    )
+
+
+# ================= CONFESSION COMMAND =================
+
+@tree.command(name="confess", description="Send anonymous confession")
 async def confess(interaction: discord.Interaction, message: str):
+    await interaction.response.defer()
 
-    # Swear filter
-    if contains_banned_word(message):
-        await interaction.response.send_message(
-            "Your confession contains inappropriate language.",
-            ephemeral=True
+    user_id = interaction.user.id
+    today = datetime.date.today().isoformat()
+
+    # DAILY LIMIT CHECK
+    record = await confessions_db.find_one({"user_id": user_id, "date": today})
+
+    if record and record["count"] >= 3:
+        await interaction.followup.send(
+            "You have reached the daily limit of 3 confessions.",
+            ephemeral=False
         )
         return
 
-    # Daily limit
-    allowed_today = await check_daily_limit(interaction.user.id)
-    if not allowed_today:
-        await interaction.response.send_message(
-            "You can only send 3 confessions per day.",
-            ephemeral=True
+    # SWEAR FILTER (basic example)
+    banned_words = ["badword1", "badword2"]
+    if any(word in message.lower() for word in banned_words):
+        await interaction.followup.send(
+            "Swear words are not allowed in confessions.",
+            ephemeral=False
         )
         return
 
-    # Global cooldown (optional)
-    allowed, remaining = await check_cooldown(
-        interaction.user.id,
-        0,  # global
-        30
+    # COOLDOWN CHECK (10 seconds example)
+    cooldown_record = await cooldown_db.find_one({"user_id": user_id})
+    now = datetime.datetime.utcnow()
+
+    if cooldown_record:
+        last_used = cooldown_record["last_used"]
+        if (now - last_used).total_seconds() < 10:
+            await interaction.followup.send(
+                "You are on cooldown. Please wait a few seconds.",
+                ephemeral=False
+            )
+            return
+
+    # Update cooldown
+    await cooldown_db.update_one(
+        {"user_id": user_id},
+        {"$set": {"last_used": now}},
+        upsert=True
     )
 
-    if not allowed:
-        await interaction.response.send_message(
-            f"You are on cooldown. Try again in {remaining} seconds.",
-            ephemeral=True
+    # Update daily count
+    if record:
+        await confessions_db.update_one(
+            {"user_id": user_id, "date": today},
+            {"$inc": {"count": 1}}
         )
-        return
+    else:
+        await confessions_db.insert_one(
+            {"user_id": user_id, "date": today, "count": 1}
+        )
 
-    embed = discord.Embed(
-        description=message,
-        color=DEFAULT_EMBED_COLOR
-    )
+    # Add to global queue
+    await confession_queue.put({"text": message})
 
-    random_tag = random.choice(ANONYMOUS_TAGS)
-    embed.set_author(name=f"Confession from {random_tag}")
-
-    # Send to ALL configured servers
-    all_guilds = guilds.find()
-
-    async for config in all_guilds:
-        channel = bot.get_channel(config["confession_channel"])
-        if channel:
-            try:
-                await channel.send(embed=embed)
-            except:
-                pass
-
-    await interaction.response.send_message(
-        "Your confession has been sent globally.",
-        ephemeral=True
+    await interaction.followup.send(
+        "Your confession has been added to the global queue.",
+        ephemeral=False
     )
 
 

@@ -37,11 +37,13 @@ counters_db = db["counters"]
 confession_queue = asyncio.Queue()
 worker_started = False
 
-DEFAULT_DELAY = 3
+DEFAULT_DELAY = 2
 DAILY_LIMIT = 3
 COOLDOWN_SECONDS = 15
+GUILD_MIN_INTERVAL = 10
 
-# Cleaner default list (no slurs hardcoded)
+guild_last_sent = {}
+
 BAD_WORDS = ["fuck", "shit", "bitch", "asshole", "slut"]
 
 # ================= GLOBAL COUNTER =================
@@ -59,20 +61,20 @@ async def generate_confession_id():
 
 async def run_automod(message: str):
     lower = message.lower()
+    normalized = re.sub(r'(.)\1{4,}', r'\1', lower)
 
-    # Invite detection
-    if re.search(r"(discord\.gg/|discord\.com/invite/)", lower):
+    if re.search(r"(discord.gg/|discord.com/invite/)", normalized):
         return True, "Invites are not allowed."
 
-    # Basic domain detection
-    if re.search(r"(https?://|www\.|\.com\b|\.net\b|\.org\b)", lower):
+    if re.search(r"(https?://|www.|.com\b|.net\b|.org\b)", normalized):
         return True, "Links are not allowed."
 
-    # Word boundary profanity filter
-    if any(re.search(rf"\b{re.escape(word)}\b", lower) for word in BAD_WORDS):
+    if any(re.search(rf"\b{re.escape(word)}\b", normalized) for word in BAD_WORDS):
         return True, "Inappropriate language detected."
 
-    # Caps spam
+    if len(message) > 1000:
+        return True, "Message too long."
+
     if len(message) > 15:
         caps_ratio = sum(c.isupper() for c in message) / len(message)
         if caps_ratio > 0.7:
@@ -80,70 +82,72 @@ async def run_automod(message: str):
 
     return False, None
 
+# ================= VOTE VIEW =================
+
+class VoteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.likes = 0
+        self.dislikes = 0
+
+    @discord.ui.button(label="👍 0", style=discord.ButtonStyle.green)
+    async def like(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.likes += 1
+        button.label = f"👍 {self.likes}"
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="👎 0", style=discord.ButtonStyle.red)
+    async def dislike(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.dislikes += 1
+        button.label = f"👎 {self.dislikes}"
+        await interaction.response.edit_message(view=self)
+
 # ================= WORKER =================
 
 async def confession_worker():
     await bot.wait_until_ready()
-    print("Confession worker started.")
-
-    semaphore = asyncio.Semaphore(10)
+    print("Worker started.")
 
     while not bot.is_closed():
         try:
             data = await confession_queue.get()
-
             confession_id = data["id"]
             message = data["text"]
 
             embed = discord.Embed(
-                title=f"🌍 Global Anonymous Confession #{confession_id}",
+                title=f"🌍 Global Confession #{confession_id}",
                 description=message,
                 color=discord.Color.purple(),
-                timestamp=datetime.datetime.utcnow()
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
 
-            active = 0
-            success = 0
-            failed = 0
-            tasks = []
-
             async for guild_data in settings_db.find({}):
-                active += 1
                 guild_id = guild_data.get("guild_id")
                 channel_id = guild_data.get("channel_id")
 
                 guild = bot.get_guild(guild_id)
                 if not guild:
-                    failed += 1
+                    continue
+
+                now = datetime.datetime.now(datetime.timezone.utc)
+                last = guild_last_sent.get(guild_id)
+
+                if last and (now - last).total_seconds() < GUILD_MIN_INTERVAL:
                     continue
 
                 channel = guild.get_channel(channel_id)
                 if not channel:
-                    await settings_db.delete_one({"guild_id": guild_id})
-                    failed += 1
                     continue
 
                 perms = channel.permissions_for(guild.me)
                 if not perms.send_messages or not perms.embed_links:
-                    failed += 1
                     continue
 
-                async def send(channel=channel, guild_name=guild.name):
-                    nonlocal success, failed
-                    async with semaphore:
-                        try:
-                            msg = await channel.send(embed=embed)
-                            await msg.add_reaction("👍")
-                            await msg.add_reaction("👎")
-                            success += 1
-                        except Exception:
-                            failed += 1
-
-                tasks.append(send())
-
-            await asyncio.gather(*tasks)
-
-            print(f"Broadcast #{confession_id} | Active:{active} Success:{success} Failed:{failed}")
+                try:
+                    await channel.send(embed=embed, view=VoteView())
+                    guild_last_sent[guild_id] = now
+                except Exception as e:
+                    print(f"Send error: {e}")
 
             await asyncio.sleep(DEFAULT_DELAY)
 
@@ -156,6 +160,11 @@ async def confession_worker():
 @bot.event
 async def on_ready():
     global worker_started
+
+    await confessions_db.create_index([("user_id", 1), ("date", 1)])
+    await settings_db.create_index("guild_id", unique=True)
+    await cooldown_db.create_index("user_id", unique=True)
+
     if not worker_started:
         bot.loop.create_task(confession_worker())
         worker_started = True
@@ -165,15 +174,21 @@ async def on_ready():
 
 # ================= SETUP =================
 
-@tree.command(name="setup", description="Set confession channel")
+@tree.command(name="setup")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
+    perms = channel.permissions_for(interaction.guild.me)
+
+    if not perms.send_messages or not perms.embed_links:
+        await interaction.response.send_message(
+            "I need send_messages and embed_links in that channel.",
+            ephemeral=True
+        )
+        return
+
     await settings_db.update_one(
         {"guild_id": interaction.guild.id},
-        {"$set": {
-            "guild_id": interaction.guild.id,
-            "channel_id": channel.id
-        }},
+        {"$set": {"guild_id": interaction.guild.id, "channel_id": channel.id}},
         upsert=True
     )
 
@@ -184,26 +199,19 @@ async def setup(interaction: discord.Interaction, channel: discord.TextChannel):
 
 # ================= CONFESS =================
 
-@tree.command(name="confess", description="Send global anonymous confession")
+@tree.command(name="confess")
 async def confess(interaction: discord.Interaction, message: str):
     await interaction.response.defer(ephemeral=True)
 
     user_id = interaction.user.id
     guild_id = interaction.guild.id
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     today = now.date().isoformat()
 
-    # Global ban check
     if await global_bans_db.find_one({"user_id": user_id}):
         await interaction.followup.send("You are globally banned.", ephemeral=True)
         return
 
-    # Per guild ban
-    if await bans_db.find_one({"guild_id": guild_id, "user_id": user_id}):
-        await interaction.followup.send("You are banned in this server.", ephemeral=True)
-        return
-
-    # Cooldown (global)
     cooldown = await cooldown_db.find_one({"user_id": user_id})
     if cooldown:
         diff = (now - cooldown["last_used"]).total_seconds()
@@ -214,7 +222,6 @@ async def confess(interaction: discord.Interaction, message: str):
             )
             return
 
-    # Daily limit (global model)
     count = await confessions_db.count_documents({
         "user_id": user_id,
         "date": today
@@ -224,21 +231,11 @@ async def confess(interaction: discord.Interaction, message: str):
         await interaction.followup.send("Daily limit reached.", ephemeral=True)
         return
 
-    # Automod
     blocked, reason = await run_automod(message)
     if blocked:
-        await confessions_db.insert_one({
-            "user_id": user_id,
-            "guild_origin": guild_id,
-            "message": message,
-            "date": today,
-            "flagged": True,
-            "reason": reason
-        })
         await interaction.followup.send(reason, ephemeral=True)
         return
 
-    # Escape mentions
     message = discord.utils.escape_mentions(message)
 
     confession_id = await generate_confession_id()
@@ -248,8 +245,7 @@ async def confess(interaction: discord.Interaction, message: str):
         "user_id": user_id,
         "guild_origin": guild_id,
         "message": message,
-        "date": today,
-        "flagged": False
+        "date": today
     })
 
     await cooldown_db.update_one(
@@ -258,14 +254,46 @@ async def confess(interaction: discord.Interaction, message: str):
         upsert=True
     )
 
-    await confession_queue.put({
-        "id": confession_id,
-        "text": message
-    })
+    await confession_queue.put({"id": confession_id, "text": message})
 
     await interaction.followup.send(
         "Your confession was sent globally.",
         ephemeral=True
+    )
+
+# ================= FUN COMMANDS =================
+
+@tree.command(name="truth")
+async def truth(interaction: discord.Interaction):
+    questions = [
+        "What is your biggest secret?",
+        "Who was your first crush?",
+        "What is something you regret?",
+        "What lie do you tell often?",
+        "What is your hidden fear?"
+    ]
+    await interaction.response.send_message(
+        f"🕵️ Truth: {questions[datetime.datetime.utcnow().second % len(questions)]}"
+    )
+
+@tree.command(name="dare")
+async def dare(interaction: discord.Interaction):
+    dares = [
+        "Change your nickname for 1 hour.",
+        "Send a random emoji in general.",
+        "Compliment someone anonymously.",
+        "Reveal your screen time.",
+        "Post your last screenshot."
+    ]
+    await interaction.response.send_message(
+        f"🔥 Dare: {dares[datetime.datetime.utcnow().second % len(dares)]}"
+    )
+
+@tree.command(name="globalstats")
+async def globalstats(interaction: discord.Interaction):
+    total = await confessions_db.count_documents({})
+    await interaction.response.send_message(
+        f"🌍 Total global confessions: {total}"
     )
 
 bot.run(TOKEN)

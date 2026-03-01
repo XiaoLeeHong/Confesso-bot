@@ -267,3 +267,5 @@ async def confess(interaction: discord.Interaction, message: str):
         "Your confession was sent globally.",
         ephemeral=True
     )
+
+bot.run(TOKEN)
